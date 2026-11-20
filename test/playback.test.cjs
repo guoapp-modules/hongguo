@@ -47,12 +47,14 @@ function load(response) {
     reserve: () => 1,
     fetch: (request) => {
       requests.push(request);
-      return { status: 200, body: JSON.stringify(typeof response === "function" ? response(request) : response), headers: {} };
+      const answer = typeof response === "function" ? response(request) : response;
+      if (answer && typeof answer.status === "number" && "body" in answer) return answer;
+      return { status: 200, body: JSON.stringify(answer), headers: {} };
     },
     fetchText: () => { throw new Error("Offline test: webpage fallback"); },
   };
   const context = vm.createContext({ host, module: { exports: {} } });
-  vm.runInContext(source + "\nmodule.exports.test = { fetchAppMedia, fetchPlayerMedia, appRequest, paths };", context);
+  vm.runInContext(source + "\nmodule.exports.test = { fetchAppMedia, fetchPlayerMedia, appRequest, paths, webMedia, webPlayback, webDesktopUserAgent, resolveVideoMedia, cencScheme };", context);
   context.module.exports.restoreCatalogState(state);
   return { api: context.module.exports, requests, context, host };
 }
@@ -134,6 +136,69 @@ test("catalog and detail keep the previous signing and endpoint", () => {
   assert.equal(new URL(requests[0].url).hostname, "api5-normal-sinfonlineb.fqnovel.com");
   assert(requests[0].headers["X-Gorgon"] && requests[0].headers["X-Argus"] && requests[0].headers["X-Ladon"]);
   assert.equal(requests[0].headers["X-Medusa"], undefined);
+});
+
+test("web playback resolves the protected fallback address", () => {
+  const mainUrl = "https://v11-hgweb.qznovelvod.com/obj/x?mime_type=video_mp4";
+  const { api, requests } = load({
+    status: 200,
+    body: JSON.stringify({ main_url: mainUrl, url_expire: 1795171132, base_resp: { StatusCode: 0, StatusMessage: "" } }),
+    headers: {},
+  });
+  const media = api.test.webMedia("7700000000000000000", videoId);
+  assert.equal(media.url, mainUrl);
+  assert.equal(media.referer, "https://hongguoduanju.com/");
+  assert.equal(requests.length, 1);
+  const request = requests[0];
+  assert.equal(request.method, "POST");
+  const url = new URL(request.url);
+  assert.equal(url.hostname, "hongguoduanju.com");
+  assert.equal(url.pathname, "/api/video/protected/fallback-play-info");
+  assert.equal(url.searchParams.get("aid"), "8662");
+  assert.deepEqual(JSON.parse(request.body), { item_id: videoId });
+  assert.equal(request.headers["User-Agent"], api.test.webDesktopUserAgent);
+  assert.equal(request.headers["Content-Type"], "application/json");
+  assert.equal(request.headers["X-Xs-From-Web"], "1");
+  assert.equal(request.headers.Referer, "https://hongguoduanju.com/");
+});
+
+test("web playback explains the five episode guest limit", () => {
+  const { api, requests } = load({ status: 403, body: JSON.stringify({ error: "public_fallback_unavailable" }), headers: {} });
+  assert.throws(() => api.test.webMedia("7700000000000000000", videoId), /前 5 集/);
+  assert.equal(requests.length, 1);
+});
+
+test("web playback reports a rejected episode without retrying", () => {
+  const { api, requests } = load({ status: 400, body: JSON.stringify({ error: "public_fallback_unavailable" }), headers: {} });
+  assert.throws(() => api.test.webMedia("7700000000000000000", videoId), /没有为该集开放地址/);
+  assert.equal(requests.length, 1);
+});
+
+test("web playback falls through to the protected stream and reports encryption", () => {
+  const { api, requests } = load((request) => {
+    if (request.url.includes("fallback-play-info")) return { status: 500, body: "", headers: {} };
+    return {
+      status: 200,
+      body: JSON.stringify({ play_info: { main_url: "https://v11-hgweb.qznovelvod.com/dash", kid: "6ae6eca9f8818b2038da6ddb0002ebeb", format: "dash" }, base_resp: { StatusCode: 0 } }),
+      headers: {},
+    };
+  });
+  assert.throws(() => api.test.webMedia("7700000000000000000", videoId), /加密的 720p/);
+  assert.equal(requests.length, 2);
+  assert.deepEqual(JSON.parse(requests[1].body), { item_id: videoId, series_id: "7700000000000000000" });
+});
+
+test("locked webpage episodes fail through the app api and stay locked", () => {
+  const { api, requests } = load((request) => request.url.includes("fallback-play-info")
+    ? { status: 403, body: JSON.stringify({ error: "public_fallback_unavailable" }), headers: {} }
+    : { status: 200, body: "", headers: {} });
+  const task = { dramaId: "hongguo:7700000000000000000", chapter: { videoUrl: api.test.cencScheme + videoId } };
+  assert.throws(() => api.test.resolveVideoMedia(task), /前 5 集/);
+  assert.equal(requests.filter((request) => request.url.includes("hongguoduanju.com/api/")).length, 1);
+  const before = requests.length;
+  assert.throws(() => api.test.resolveVideoMedia(task), /暂时不再尝试网页取流/);
+  assert.equal(requests.filter((request) => request.url.includes("hongguoduanju.com/api/")).length, 1);
+  assert(requests.length > before);
 });
 
 test("v5 digest and carrier match independent synthetic vectors", () => {

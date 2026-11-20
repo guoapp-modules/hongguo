@@ -4,6 +4,7 @@ const playbackBaseUrl = "https://api5-normal-sinfonlinea.fqnovel.com";
 const playbackUserAgent = "com.phoenix.read/73932 (Linux; U; Android 12; zh_CN_#Hans; PGT-AN10; Build/V417IR;tt-ok/3.12.13.20)";
 const appUserAgent = "com.phoenix.read/73532 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)";
 const webUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6 Mobile/15E148 Safari/604.1";
+const webDesktopUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 const deviceRegisterUrl = "https://log.snssdk.com/service/2/device_register/";
 const mediaReferer = "https://novel.snssdk.com/";
 const responseLimit = 20 * 1024 * 1024;
@@ -22,6 +23,7 @@ const danmakuMaxDurationMs = 24 * 60 * minuteMs;
 const defaultMaxPages = 50;
 const deviceRotations = 3;
 const registerPauseMs = 10 * minuteMs;
+const webLockMs = 30 * minuteMs;
 const appRequestTimeoutMs = 20 * secondMs;
 const searchTimeoutMs = 40 * secondMs;
 const searchPageTimeoutMs = 12 * secondMs;
@@ -59,6 +61,12 @@ const paths = {
   audioDirectory: "/reading/bookapi/directory/all_items/v1/",
   audioPlayInfo: "/reading/reader/audio/playinfo/",
   audioSearch: "/reading/bookapi/search/tab/v1/",
+};
+
+const webPlayback = {
+  fallback: "/api/video/protected/fallback-play-info",
+  playInfo: "/api/video/protected/play-info",
+  appId: "8662",
 };
 
 const genres = [
@@ -1558,7 +1566,7 @@ function appRequest(method, path, extra, payload, options) {
       continue;
     }
     if (response.body.length === 0) {
-      lastError = new Error("红果 App 接口未返回有效数据");
+      lastError = new Error("红果 App 接口对本次设备签名返回空响应，风控未放行");
       if (signed && rotations < deviceRotations) {
         try {
           ensureDevice(helper, deviceId);
@@ -1573,7 +1581,7 @@ function appRequest(method, path, extra, payload, options) {
         }
       }
       if (registerError !== null) {
-        lastError = new Error("红果 App 接口未返回有效数据（设备注册失败：" + message(registerError) + "）");
+        lastError = new Error("红果 App 接口对本次设备签名返回空响应，风控未放行（设备注册失败：" + message(registerError) + "）");
       }
       continue;
     }
@@ -1592,7 +1600,7 @@ function appRequest(method, path, extra, payload, options) {
     }
     return result;
   }
-  throw lastError || new Error("红果 App 接口未返回有效数据");
+  throw lastError || new Error("红果 App 接口没有返回可用的播放数据");
 }
 
 function fetchSiteText(address, noCache) {
@@ -2262,11 +2270,21 @@ function resolveVideoMedia(task) {
   } catch (error) {
     nativeError = error;
   }
+  if (cacheRead(webLockKey(videoId)) !== null) {
+    throw new Error("红果取流失败：" + message(nativeError) + "；网页此前已拒绝该集，暂时不再尝试网页取流");
+  }
   try {
     return webMedia(seriesId, videoId);
   } catch (pageError) {
+    if (pageError.locked) {
+      cacheWrite(webLockKey(videoId), 1, webLockMs);
+    }
     throw new Error("红果 App 取流失败：" + message(nativeError) + "；网页取流失败：" + message(pageError));
   }
+}
+
+function webLockKey(videoId) {
+  return "weblocked:" + videoId;
 }
 
 function appMedia(videoId) {
@@ -2347,10 +2365,12 @@ function fetchPlayerMedia(videoId, helper) {
 function appVideoModel(data) {
   let model = isRecord(data.video_model) ? data.video_model : null;
   if (typeof data.video_model === "string" && data.video_model !== "") {
-    let encoded = data.video_model;
-    const decoded = decodeBase64Text(encoded);
-    if (decoded !== null && decoded !== "") {
-      encoded = decoded;
+    let encoded = data.video_model.trim();
+    if (encoded.charAt(0) !== "{" && encoded.charAt(0) !== "[") {
+      const decoded = decodeBase64Text(encoded);
+      if (decoded !== null && decoded !== "") {
+        encoded = decoded;
+      }
     }
     try {
       model = parseJson(encoded);
@@ -2439,24 +2459,79 @@ function selectAppMedia(model) {
   throw noMedia("已跳过不支持的编码，其余线路没有播放地址");
 }
 
+function webPlaybackRequest(path, payload) {
+  const response = host.fetch({
+    method: "POST",
+    url: siteBaseUrl + path + "?aid=" + webPlayback.appId,
+    headers: {
+      "User-Agent": webDesktopUserAgent,
+      "Content-Type": "application/json",
+      Accept: "application/json, text/plain, */*",
+      Referer: siteBaseUrl + "/",
+      "X-Xs-From-Web": "1",
+    },
+    body: JSON.stringify(payload),
+    limit: 256 * 1024,
+    timeoutMs: appRequestTimeoutMs,
+    followRedirects: true,
+    anyStatus: true,
+  });
+  let result = null;
+  try {
+    result = parseJson(response.body);
+  } catch (error) {
+    result = null;
+  }
+  return { status: response.status, result: isRecord(result) ? result : null };
+}
+
+function webPlaybackError(status, result) {
+  const detail = firstNonEmpty(
+    mapString(nested(result, "base_resp"), "StatusMessage"),
+    mapString(result, "error"),
+    mapString(result, "message"),
+  );
+  const reason = detail === "" ? "HTTP " + status : truncate(detail, 40);
+  if (status === 403) {
+    const locked = new Error("红果网页只免费开放每部剧的前 5 集，该集需要登录或 App 授权（" + reason + "）");
+    locked.locked = true;
+    return locked;
+  }
+  if (status === 400) {
+    const rejected = new Error("红果网页播放接口没有为该集开放地址（" + reason + "）");
+    rejected.locked = true;
+    return rejected;
+  }
+  if (status === 0) {
+    return new Error("红果网页播放接口请求失败");
+  }
+  return new Error("红果网页播放接口请求失败（" + reason + "）");
+}
+
 function webMedia(seriesId, videoId) {
-  const body = fetchSiteText(siteBaseUrl + "/player/" + encodeURIComponent(seriesId) + "/" + encodeURIComponent(videoId));
-  const page = routerLoaderMap(parseRouterData(body), "player_", "player_page");
-  if (mapString(page, "vid") !== videoId || mapString(page, "series_id") !== seriesId) {
-    throw new Error("红果未返回所请求的剧集，可能仅允许网页试看；请在站点确认该集的访问权限");
-  }
-  const info = nested(page, "video_player_info");
-  const addresses = mediaAddresses(info);
-  if (addresses.length === 0) {
-    throw new Error("红果该集未提供公开播放地址，可能需要登录或 App 授权；不会将试看集冒充该集下载");
-  }
-  const duration = parseNumber(mapString(info, "duration"));
-  const durationMs = Number.isFinite(duration) ? Math.trunc(duration * secondMs) : 0;
   const referer = siteBaseUrl + "/";
-  return {
-    url: addresses[0], referer, durationMs,
-    variants: addresses.map((address) => ({ url: address, referer, durationMs })),
-  };
+  const fallback = webPlaybackRequest(webPlayback.fallback, { item_id: videoId });
+  if (fallback.status === 200) {
+    const addresses = mediaAddresses(fallback.result);
+    if (addresses.length > 0) {
+      return {
+        url: addresses[0], referer, durationMs: 0,
+        variants: addresses.map((address) => ({ url: address, referer, durationMs: 0 })),
+      };
+    }
+  }
+  if (fallback.status === 400 || fallback.status === 403) {
+    throw webPlaybackError(fallback.status, fallback.result);
+  }
+  const protectedPlayback = webPlaybackRequest(webPlayback.playInfo, { item_id: videoId, series_id: seriesId });
+  const protectedInfo = nested(protectedPlayback.result, "play_info");
+  if (protectedPlayback.status === 200 && isRecord(protectedInfo)) {
+    throw new Error("红果该集只给出加密的 720p 播放流，没有可直接下载的地址");
+  }
+  if (protectedPlayback.status === 403) {
+    throw webPlaybackError(403, protectedPlayback.result);
+  }
+  throw webPlaybackError(fallback.status, fallback.result);
 }
 
 function fetchSuggestionRecords(query, count, deadline) {
