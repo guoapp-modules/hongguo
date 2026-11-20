@@ -47,12 +47,14 @@ function load(response) {
     reserve: () => 1,
     fetch: (request) => {
       requests.push(request);
-      return { status: 200, body: JSON.stringify(typeof response === "function" ? response(request) : response), headers: {} };
+      const answer = typeof response === "function" ? response(request) : response;
+      if (answer && typeof answer.status === "number" && "body" in answer) return answer;
+      return { status: 200, body: JSON.stringify(answer), headers: {} };
     },
     fetchText: () => { throw new Error("Offline test: webpage fallback"); },
   };
   const context = vm.createContext({ host, module: { exports: {} } });
-  vm.runInContext(source + "\nmodule.exports.test = { fetchAppMedia, fetchPlayerMedia, appRequest, paths };", context);
+  vm.runInContext(source + "\nmodule.exports.test = { appMedia, fetchAppMedia, fetchTabMedia, fetchPlayerMedia, selectAppMedia, appRequest, paths, webMedia, webPlayback, webDesktopUserAgent, resolveVideoMedia, cencScheme };", context);
   context.module.exports.restoreCatalogState(state);
   return { api: context.module.exports, requests, context, host };
 }
@@ -128,12 +130,112 @@ test("malformed and rejected models fail explicitly", () => {
   assert.throws(() => api.test.fetchPlayerMedia(videoId, false), /403/);
 });
 
+test("flat pc lanes are read without the nested video metadata", () => {
+  const spade = "lbwbxmKBGftitzL5Y7EtzVaKGsVRvC3zZ48b80uNN99klCyJiQ==";
+  const { api } = load({ code: 0, data: { video_model_data: { [videoId]: { video_model: {
+    video_duration: 58.167, key_seed: "unused",
+    video_list: [
+      { main_url: "https://media.example.invalid/360.mp4", definition: "360p", codec_type: "bytevc1", vwidth: 360, vheight: 640, encrypt: true, encryption_method: "cenc-aes-ctr", kid: "kid-360", spade_a: spade },
+      { main_url: "https://media.example.invalid/720.mp4", definition: "720p", codec_type: "bytevc1", vwidth: 720, vheight: 1280, encrypt: true, encryption_method: "cenc-aes-ctr", kid: "kid-720", spade_a: spade },
+    ],
+  } } } } });
+  const media = api.test.fetchTabMedia(videoId, false, "pc");
+  assert.equal(media.url, "https://media.example.invalid/720.mp4");
+  assert.equal(media.quality, 720);
+  assert.equal(media.durationMs, 58167);
+  assert.equal(media.cencKey.length, 24);
+  assert.equal(media.variants.length, 2);
+});
+
+test("incompatible codecs are retried on the pc lane", () => {
+  const vvc = { video_duration: 58.167, video_list: [
+    { main_url: "https://media.example.invalid/vvc.mp4", video_meta: { codec_type: "bytevc2", definition: "720p" }, gear_des_key: "1:encrypt|2:bytevc2|4:720p" },
+  ] };
+  const { api, requests } = load((request) => {
+    const url = new URL(request.url);
+    if (url.searchParams.get("device_platform") !== "pc") return { code: 0, data: { video_model_data: { [videoId]: { video_model: vvc } } } };
+    return { code: 0, data: { video_model_data: { [videoId]: { video_model: { video_duration: 58.167, video_list: [
+      { main_url: "https://media.example.invalid/pc720.mp4", definition: "720p", codec_type: "bytevc1", vwidth: 720, vheight: 1280 },
+    ] } } } } };
+  });
+  const media = api.test.appMedia(videoId);
+  assert.equal(media.url, "https://media.example.invalid/pc720.mp4");
+  assert.equal(media.quality, 720);
+  const lanes = requests.map((request) => (new URL(request.url).searchParams.get("device_platform") || "default"));
+  assert.deepEqual(lanes, ["android", "pc"]);
+  assert.equal(new URL(requests[1].url).pathname, "/reading/bookapi/video_tab/multi_video_model/v1/");
+  assert.equal(new URL(requests[1].url).searchParams.get("device_id"), state.deviceId);
+});
+
 test("catalog and detail keep the previous signing and endpoint", () => {
   const { api, requests } = load({ code: 0, data: {} });
   api.test.appRequest("POST", api.test.paths.videoDetail, null, { series_id: "7700000000000000000" });
   assert.equal(new URL(requests[0].url).hostname, "api5-normal-sinfonlineb.fqnovel.com");
   assert(requests[0].headers["X-Gorgon"] && requests[0].headers["X-Argus"] && requests[0].headers["X-Ladon"]);
   assert.equal(requests[0].headers["X-Medusa"], undefined);
+});
+
+test("web playback resolves the protected fallback address", () => {
+  const mainUrl = "https://v11-hgweb.qznovelvod.com/obj/x?mime_type=video_mp4";
+  const { api, requests } = load({
+    status: 200,
+    body: JSON.stringify({ main_url: mainUrl, url_expire: 1795171132, base_resp: { StatusCode: 0, StatusMessage: "" } }),
+    headers: {},
+  });
+  const media = api.test.webMedia("7700000000000000000", videoId);
+  assert.equal(media.url, mainUrl);
+  assert.equal(media.referer, "https://hongguoduanju.com/");
+  assert.equal(requests.length, 1);
+  const request = requests[0];
+  assert.equal(request.method, "POST");
+  const url = new URL(request.url);
+  assert.equal(url.hostname, "hongguoduanju.com");
+  assert.equal(url.pathname, "/api/video/protected/fallback-play-info");
+  assert.equal(url.searchParams.get("aid"), "8662");
+  assert.deepEqual(JSON.parse(request.body), { item_id: videoId });
+  assert.equal(request.headers["User-Agent"], api.test.webDesktopUserAgent);
+  assert.equal(request.headers["Content-Type"], "application/json");
+  assert.equal(request.headers["X-Xs-From-Web"], "1");
+  assert.equal(request.headers.Referer, "https://hongguoduanju.com/");
+});
+
+test("web playback explains the five episode guest limit", () => {
+  const { api, requests } = load({ status: 403, body: JSON.stringify({ error: "public_fallback_unavailable" }), headers: {} });
+  assert.throws(() => api.test.webMedia("7700000000000000000", videoId), /前 5 集/);
+  assert.equal(requests.length, 1);
+});
+
+test("web playback reports a rejected episode without retrying", () => {
+  const { api, requests } = load({ status: 400, body: JSON.stringify({ error: "public_fallback_unavailable" }), headers: {} });
+  assert.throws(() => api.test.webMedia("7700000000000000000", videoId), /没有为该集开放地址/);
+  assert.equal(requests.length, 1);
+});
+
+test("web playback falls through to the protected stream and reports encryption", () => {
+  const { api, requests } = load((request) => {
+    if (request.url.includes("fallback-play-info")) return { status: 500, body: "", headers: {} };
+    return {
+      status: 200,
+      body: JSON.stringify({ play_info: { main_url: "https://v11-hgweb.qznovelvod.com/dash", kid: "6ae6eca9f8818b2038da6ddb0002ebeb", format: "dash" }, base_resp: { StatusCode: 0 } }),
+      headers: {},
+    };
+  });
+  assert.throws(() => api.test.webMedia("7700000000000000000", videoId), /加密的 720p/);
+  assert.equal(requests.length, 2);
+  assert.deepEqual(JSON.parse(requests[1].body), { item_id: videoId, series_id: "7700000000000000000" });
+});
+
+test("locked webpage episodes fail through the app api and stay locked", () => {
+  const { api, requests } = load((request) => request.url.includes("fallback-play-info")
+    ? { status: 403, body: JSON.stringify({ error: "public_fallback_unavailable" }), headers: {} }
+    : { status: 200, body: "", headers: {} });
+  const task = { dramaId: "hongguo:7700000000000000000", chapter: { videoUrl: api.test.cencScheme + videoId } };
+  assert.throws(() => api.test.resolveVideoMedia(task), /前 5 集/);
+  assert.equal(requests.filter((request) => request.url.includes("hongguoduanju.com/api/")).length, 1);
+  const before = requests.length;
+  assert.throws(() => api.test.resolveVideoMedia(task), /暂时不再尝试网页取流/);
+  assert.equal(requests.filter((request) => request.url.includes("hongguoduanju.com/api/")).length, 1);
+  assert(requests.length > before);
 });
 
 test("v5 digest and carrier match independent synthetic vectors", () => {
